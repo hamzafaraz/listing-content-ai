@@ -319,7 +319,7 @@ export default function Home() {
             <p className="text-xl text-gray-700 mb-4">
               <strong className="text-gray-900">&quot;Before ListingContentAI, I spent 2-3 hours planning content for each listing project. Now it takes 3 minutes.&quot;</strong>
             </p>
-            <p className="text-gray-600">— Sarah K., Amazon Listing Designer</p>
+            <p className="text-gray-600">— John, Amazon Listing Designer</p>
           </div>
         </div>
       </section>
@@ -664,9 +664,6 @@ export default function Home() {
             <div>
               <h4 className="font-bold mb-4">Company</h4>
               <p className="text-gray-400 mb-2">
-                <strong className="text-white">Hamza Faraz</strong><br />
-                <span className="text-purple-400">
-                  CEO @ Desprot Design
                 </span>
               </p>
               <p className="text-gray-400 text-sm">
