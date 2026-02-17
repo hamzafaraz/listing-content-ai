@@ -1,0 +1,1354 @@
+'use client';
+// FIXED VERSION 3 (Clean Rewrite) - Force Recompile
+
+import React, { useState, useRef } from 'react';
+import { Upload, Download, Loader2, Zap, FileText, ImageIcon, Lightbulb, Trash2, Printer } from 'lucide-react';
+import { supabase } from '@/lib/supabaseClient';
+import { useUser } from '@clerk/nextjs';
+import { restrictedKeywords } from '@/data/restrictedKeywords';
+
+
+interface AmazonListingDesignAgentProps {
+    onShowPricing?: () => void;
+}
+
+// Helper to robustly extract JSON from AI response
+const extractJson = (text: string) => {
+    try {
+        // 1. Try to find JSON within markdown code blocks (```json ... ``` or ``` ... ```)
+        const jsonBlockRegex = /```(?:json)?\s*([\s\S]*?)\s*```/g;
+        let match;
+        while ((match = jsonBlockRegex.exec(text)) !== null) {
+            try {
+                return JSON.parse(match[1]);
+            } catch (e) {
+                // Continue searching if this block isn't valid JSON
+            }
+        }
+
+        // 2. Try cleaning the text and parsing directly
+        const cleanText = text.replace(/```json\s*|```/g, '').trim();
+        if (cleanText.startsWith('{') || cleanText.startsWith('[')) {
+            try {
+                return JSON.parse(cleanText);
+            } catch (e) {
+                // Fallback to bracket matching
+            }
+        }
+
+        // 3. Brute force bracket matching (first '{' to last '}')
+        const startIndex = text.indexOf('{');
+        const endIndex = text.lastIndexOf('}');
+
+        if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
+            const jsonStr = text.substring(startIndex, endIndex + 1);
+            return JSON.parse(jsonStr);
+        }
+
+        throw new Error('No valid JSON object found in response');
+    } catch (e) {
+        console.error('JSON Parse Error:', e);
+        console.log('Original Text:', text);
+        throw new Error('Failed to parse AI response. Please try again or check if the prompt is too complex.');
+    }
+};
+
+export default function AmazonListingDesignAgent({ onShowPricing }: AmazonListingDesignAgentProps) {
+    console.log("ListingContentAI Version: 3m-PDF-2000px-v4");
+    const [projectInputs, setProjectInputs] = useState({
+        clientMessages: '',
+        productASIN: '',
+        competitorLinks: '',
+        additionalInfo: ''
+    });
+
+    const [productImages, setProductImages] = useState<any[]>([]);
+    const [competitorImages, setCompetitorImages] = useState<any[]>([]);
+    const [brandLogo, setBrandLogo] = useState<any>(null); // New state for Brand Logo
+    const [generating, setGenerating] = useState(false);
+    const [designPlan, setDesignPlan] = useState<any>(null);
+    const { user, isLoaded } = useUser();
+    const [isSaving, setIsSaving] = useState(false);
+    const [saveMessage, setSaveMessage] = useState('');
+    const [error, setError] = useState('');
+    const [progress, setProgress] = useState('');
+    const [refiningImageId, setRefiningImageId] = useState<number | null>(null);
+    const [refinementInstruction, setRefinementInstruction] = useState('');
+
+    // Access Control State
+    const [hasAccess, setHasAccess] = useState<boolean | null>(null); // null = loading
+    const [accessRequestStatus, setAccessRequestStatus] = useState<'idle' | 'loading' | 'success' | 'existing'>('idle');
+    const [usageCount, setUsageCount] = useState<number>(0);
+    const [usageLimit, setUsageLimit] = useState<number>(1);
+    const [currentPlan, setCurrentPlan] = useState<string>('Free Demo');
+    const [isUpgradeModalOpen, setIsUpgradeModalOpen] = useState(false);
+    const [isPartialResult, setIsPartialResult] = useState(false);
+    const [lastProjectId, setLastProjectId] = useState<string | null>(null);
+
+    // Round 12: Wait Animation State
+    const [timeRemaining, setTimeRemaining] = useState<number>(0);
+    const [waitProgress, setWaitProgress] = useState<number>(0);
+
+    React.useEffect(() => {
+        if (!isLoaded || !user) return;
+
+        const checkAccess = async () => {
+            try {
+                const response = await fetch('/api/subscription/check');
+                const data = await response.json();
+
+                if (data.error) throw new Error(data.error);
+
+                setHasAccess(data.hasAccess);
+                setUsageCount(data.usage);
+                setUsageLimit(data.limit);
+                setCurrentPlan(data.plan);
+
+                // If existing subscription implies we might need to update local state logic regarding "request status"
+                // But the simplified logic matches the backend now.
+                // We can check if plan is not "Free Demo" to assume "existing" status if we want, 
+                // but the strictly crucial part is hasAccess/usage/limit.
+                if (data.plan !== 'Free Demo') {
+                    setAccessRequestStatus('existing');
+                }
+
+            } catch (err) {
+                console.error('Failed to check access:', err);
+                // Fallback to safe defaults
+                setHasAccess(false);
+            }
+        };
+
+        checkAccess();
+    }, [isLoaded, user]);
+
+    const requestAccess = async () => {
+        if (!user) return;
+        setAccessRequestStatus('loading');
+        // ... rest of requestAccess (we can leave this or update it to use API too, but strictly reading is the issue now)
+        // ideally we should also use API for creating subscription, but for now let's fix the READ.
+
+        // Check local state or re-fetch?
+        // For now, let's just use the Supabase client for WRITING (requesting access) if that works, 
+        // or just use the same manual flow.
+
+        const { data: existing } = await supabase.from('subscriptions').select('id').eq('user_id', user.id).single();
+
+        if (existing) {
+            setAccessRequestStatus('existing');
+            return;
+        }
+
+        const { error } = await supabase.from('subscriptions').insert({
+            user_id: user.id,
+            status: 'pending_approval',
+            payment_method: 'manual'
+        });
+
+        if (!error) {
+            setAccessRequestStatus('success');
+        } else {
+            console.error(error);
+            alert('Failed to request access. Please try again.');
+            setAccessRequestStatus('idle');
+        }
+    };
+
+
+    const productFileRef = useRef<HTMLInputElement>(null);
+    const competitorFileRef = useRef<HTMLInputElement>(null);
+    const brandLogoRef = useRef<HTMLInputElement>(null);
+
+    const handleImageUpload = (files: FileList | null, type: 'product' | 'competitor' | 'logo') => {
+        if (!files) return;
+        const fileList = Array.from(files).filter(file => file.type.startsWith('image/'));
+
+        if (type === 'logo') {
+            // Logo is single file
+            const file = fileList[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                setBrandLogo({
+                    file,
+                    preview: e.target?.result as string,
+                    name: file.name,
+                    base64: (e.target?.result as string).split(',')[1],
+                    mimeType: file.type
+                });
+            };
+            reader.readAsDataURL(file);
+            return;
+        }
+
+        fileList.forEach(file => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const newImage = {
+                    file,
+                    preview: e.target?.result as string,
+                    name: file.name,
+                    base64: (e.target?.result as string).split(',')[1],
+                    mimeType: file.type
+                };
+
+                if (type === 'product') {
+                    setProductImages(prev => [...prev, newImage]);
+                } else {
+                    setCompetitorImages(prev => [...prev, newImage]);
+                }
+            };
+            reader.readAsDataURL(file);
+        });
+    };
+
+    const removeImage = (index: number, type: 'product' | 'competitor' | 'logo') => {
+        if (type === 'product') {
+            setProductImages(prev => prev.filter((_, i) => i !== index));
+        } else if (type === 'competitor') {
+            setCompetitorImages(prev => prev.filter((_, i) => i !== index));
+        } else if (type === 'logo') {
+            setBrandLogo(null);
+        }
+    };
+
+    const handleRefine = async (image: any) => {
+        if (!refinementInstruction.trim()) return;
+
+        setRefiningImageId(image.imageNumber);
+
+        try {
+            const response = await fetch('/api/refine', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    imagePlan: image,
+                    userInstruction: refinementInstruction,
+                    projectContext: designPlan.analysis
+                })
+            });
+
+            const data = await response.json();
+
+            if (data.error) throw new Error(data.error.message);
+
+            // Update the specific image in the design plan
+            const updatedImages = designPlan.images.map((img: any) =>
+                img.imageNumber === image.imageNumber ? data.updatedPlan : img
+            );
+
+            setDesignPlan({
+                ...designPlan,
+                images: updatedImages
+            });
+
+            setRefinementInstruction('');
+            setRefiningImageId(null);
+            alert('Image plan updated successfully!');
+
+        } catch (err: any) {
+            console.error('Refinement failed:', err);
+            alert('Failed to refine image: ' + err.message);
+            setRefiningImageId(null);
+        }
+    };
+
+    const generateDesignPlan = async () => {
+        // Validation Checks
+        if (!projectInputs.clientMessages.trim()) {
+            setError('Please provide Client Messages & Requirements to proceed.');
+            return;
+        }
+
+        if (!projectInputs.competitorLinks.trim()) {
+            setError('Please provide Target Competitor Links to proceed.');
+            return;
+        }
+
+        if (competitorImages.length === 0) {
+            setError('Please upload at least 1 Competitor/Reference Image.');
+            return;
+        }
+
+        if (productImages.length < 4) {
+            setError(`Please upload at least 4 product images(you have ${productImages.length}).`);
+            return;
+        }
+
+        setGenerating(true);
+        setError('');
+        setDesignPlan(null);
+        setProgress('Initializing AI Agent...');
+        setTimeRemaining(180); // Revert to 3 minutes (180s)
+        setWaitProgress(0);
+
+        try {
+            // Artificial Delay Loop (180 Seconds)
+            const startTime = Date.now();
+            const totalDuration = 180 * 1000; // 180 seconds
+
+            const updateTimer = async () => {
+                while (true) {
+                    const elapsed = Date.now() - startTime;
+                    if (elapsed >= totalDuration) break;
+
+                    const remaining = Math.ceil((totalDuration - elapsed) / 1000);
+                    const progressVal = (elapsed / totalDuration) * 100;
+
+                    setTimeRemaining(remaining);
+                    setWaitProgress(progressVal);
+
+                    // Dynamic status messages based on progress
+                    if (progressVal < 20) setProgress('Analyzing product images and brand identity...');
+                    else if (progressVal < 40) setProgress('Studying competitor strategies and market trends...');
+                    else if (progressVal < 60) setProgress('Identifying key selling points and customer needs...');
+                    else if (progressVal < 80) setProgress('Drafting visual hierarchy and copywriting...');
+                    else setProgress(`Finalizing ${currentPlan === 'Free Demo' ? '3' : '7'}-image conversion focused design plan...`);
+
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            };
+
+            // We will run the timer loop and the API calls. We wait for both.
+            const timerPromise = updateTimer();
+
+            // Step 1: Analyze all inputs
+            // Build the analysis prompt
+            const isFree = currentPlan.toLowerCase().includes('free');
+            const imageCount = isFree ? 3 : 7;
+
+            let analysisPrompt = `You are an expert Amazon listing designer. Analyze all the provided information to create a comprehensive ${imageCount}-image Amazon listing design plan.
+
+CRITICAL RESTRICTION: You must NEVER use the following restricted keywords or phrases in your output:
+${restrictedKeywords.join(', ')}
+
+CLIENT INFORMATION:
+${projectInputs.clientMessages || 'No client messages provided'}
+
+PRODUCT ASIN / URL:
+${projectInputs.productASIN || 'Not provided'}
+
+COMPETITOR LINKS:
+${projectInputs.competitorLinks || 'Not provided'}
+
+ADDITIONAL INFORMATION:
+${projectInputs.additionalInfo || 'Not provided'}
+
+I have uploaded:
+- ${productImages.length} product image(s)
+    - ${competitorImages.length} competitor / reference image(s)
+        - ${brandLogo ? '1 Brand Logo' : 'No Brand Logo'}
+
+Please analyze:
+1. The product images to understand what we're selling
+2. The competitor images to understand market standards and what works
+3. Client requirements and expectations
+4. Industry best practices for Amazon listings
+5. Brand identity based on logo(if provided)
+
+Respond with ONLY a JSON object analyzing the project:
+{
+    "productAnalysis": "What is the product and its key features?",
+    "targetAudience": "Who is the target customer?",
+    "competitorInsights": "What design patterns work in this niche?",
+    "keySellingPoints": ["array of 5-7 key selling points to highlight"],
+    "designStrategy": "Overall strategy for the ${currentPlan.toLowerCase().includes('free') ? '3' : '7'}-image listing"
+} `;
+
+            // Add product images
+            const analysisContent: any[] = [{
+                type: 'text',
+                text: analysisPrompt
+            }];
+
+            if (brandLogo) {
+                analysisContent.push({
+                    type: 'image',
+                    source: {
+                        type: 'base64',
+                        media_type: brandLogo.mimeType,
+                        data: brandLogo.base64
+                    }
+                });
+            }
+
+            productImages.forEach(img => {
+                analysisContent.push({
+                    type: 'image',
+                    source: {
+                        type: 'base64',
+                        media_type: img.mimeType,
+                        data: img.base64
+                    }
+                });
+            });
+
+            competitorImages.forEach(img => {
+                analysisContent.push({
+                    type: 'image',
+                    source: {
+                        type: 'base64',
+                        media_type: img.mimeType,
+                        data: img.base64
+                    }
+                });
+            });
+
+            const analysisResponse = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    max_tokens: 4000,
+                    messages: [{
+                        role: 'user',
+                        content: analysisContent
+                    }]
+                })
+            });
+
+            const analysisData = await analysisResponse.json();
+
+            if (analysisData.error) {
+                throw new Error(analysisData.error.message || 'Analysis failed');
+            }
+
+            const analysisText = analysisData.content
+                .filter((item: any) => item.type === 'text')
+                .map((item: any) => item.text)
+                .join('\n');
+
+            const analysis = extractJson(analysisText);
+
+            // Step 2: Generate design plan for all images
+            setProgress(`Step 2/3: Creating design plan for ${currentPlan.toLowerCase().includes('free') ? '3' : '7'} images...`);
+
+            const designPrompt = `Based on this analysis:
+
+${JSON.stringify(analysis, null, 2)}
+
+Create a complete design plan for ${imageCount} Amazon listing images. Each image should serve a specific purpose in the customer journey.
+
+CRITICAL: You must generate EXACTLY ${imageCount} images. 
+${isFree ? 'DO NOT include Image 4, 5, 6, or 7. Provide ONLY Image 1, 2, and 3.' : 'Provide Images 1, 2, 3, 4, 5, 6, and 7.'}
+
+Standard Amazon listing image strategy:
+- Image 1: Main product shot (white background). NO HEADING TEXT. Only a short, strong product keyword badge.
+- Image 2: Lifestyle / in-use shot. MUST HAVE clear headline and bullet points describing the benefit.
+- Image 3: Key features infographic
+${!currentPlan.toLowerCase().includes('free') ? `
+- Image 4: Size / dimensions or comparison chart
+- Image 5: Additional benefits or use cases
+- Image 6: Quality / certification / trust elements
+- Image 7: Final conversion image. Focus on value and trust. IMPORTANT: DO NOT USE "ADD TO CART". DO NOT GENERATE ANY CALL-TO-ACTION (CTA) text.
+` : ''}
+
+Respond with ONLY a JSON object:
+{
+    "images": [
+        {
+            "imageNumber": 1,
+            "purpose": "Brief description of this image's purpose",
+            "textContent": {
+                "headline": "Main headline text (MANDATORY FOR ALL IMAGES EXCEPT IMAGE 1)",
+                "subheadline": "Sub-headline text",
+                "bulletPoints": ["bullet 1", "bullet 2"],
+                "badges": ["badge text"]
+            },
+            "visualGuidance": {
+                "layout": "Description of layout structure",
+                "colorScheme": "Primary colors to use",
+                "typography": "Font style guidance",
+                "keyElements": ["element 1", "element 2"],
+                "style": "Overall visual style (modern, minimal, bold, etc.)"
+            },
+            "aiPrompt": "Start exactly with: 'High-resolution 2000x2000 pixel square image (1:1 aspect ratio)'. Then provide a HIGHLY DETAILED description including lighting, camera angle, and mood. REQUIREMENT: The product must appear exactly as uploaded, maintaining all structural and branding details.",
+            "productDisplayPrompt": "REQUIRED FOR EVERY IMAGE. Start exactly with: 'High-resolution 2000x2000 pixel square product shot (1:1 aspect ratio)'. NO TEXT, NO LETTERS, NO NUMBERS, NO OVERLAYS. Describe the product's physical appearance and its specific visual environment/display for THIS SPECIFIC IMAGE (e.g., Image 1: clean studio shot; Image 2: lifestyle setting; Image 3: organized for infographic, etc.). DO NOT REPEAT the same prompt for different images. Focus ONLY on the backgrounds and visual display. The product must look EXACTLY as shown in the input images."
+        }
+    ]
+} `;
+
+            const designResponse = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    max_tokens: 4000,
+                    messages: [{
+                        role: 'user',
+                        content: designPrompt
+                    }]
+                })
+            });
+
+            const designData = await designResponse.json();
+
+            if (designData.error) {
+                throw new Error(designData.error.message || 'Design generation failed');
+            }
+
+            const designText = designData.content
+                .filter((item: any) => item.type === 'text')
+                .map((item: any) => item.text)
+                .join('\n');
+
+            const designPlanResult = extractJson(designText);
+
+            // Wait for the timer to finish if it hasn't already (it likely hasn't)
+            await timerPromise;
+
+            setProgress('Step 3/3: Finalizing design plan...');
+
+            const finalImages = isFree ? designPlanResult.images.slice(0, 3) : designPlanResult.images;
+
+            setDesignPlan({
+                analysis,
+                images: finalImages
+            });
+
+            setProgress('Design plan complete! ✓');
+
+            if (isFree) {
+                setIsPartialResult(true);
+                setIsUpgradeModalOpen(true);
+            }
+
+            // Auto-save to enforce usage limit and save user work
+            if (user) {
+                try {
+                    // Use server-side API to bypass RLS issues
+                    const saveResponse = await fetch('/api/projects/save', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            project_name: 'Listing Plan - ' + (projectInputs.productASIN || 'New Project'),
+                            input_data: {
+                                ...projectInputs,
+                                is_partial: isFree
+                            },
+                            generated_output: {
+                                analysis,
+                                images: finalImages
+                            }
+                        })
+                    });
+
+                    if (saveResponse.ok) {
+                        const saveData = await saveResponse.json();
+                        setLastProjectId(saveData.project.id);
+                        setUsageCount(prev => prev + 1);
+                        // setSaveMessage('Auto-saved to Dashboard! 💾'); // Hidden as per user request
+                    } else {
+                        console.error('Auto-save failed:', await saveResponse.text());
+                    }
+                } catch (saveErr) {
+                    console.error('Auto-save failed:', saveErr);
+                }
+            }
+
+        } catch (err: any) {
+            setError(err.message || 'An error occurred while generating the design plan');
+            setProgress('');
+        } finally {
+            setGenerating(false);
+        }
+    };
+
+    const resumeGeneration = async () => {
+        if (!designPlan || !lastProjectId || currentPlan.toLowerCase().includes('free')) {
+            onShowPricing?.();
+            return;
+        }
+
+        setGenerating(true);
+        setError('');
+        setProgress('Resuming generation for remaining images...');
+        setTimeRemaining(120); // 2 minutes for 4 images
+        setWaitProgress(0);
+
+        try {
+            // Timer for resume
+            const startTime = Date.now();
+            const totalDuration = 120 * 1000;
+            const updateTimer = async () => {
+                while (true) {
+                    const elapsed = Date.now() - startTime;
+                    if (elapsed >= totalDuration) break;
+                    const remaining = Math.ceil((totalDuration - elapsed) / 1000);
+                    const progressVal = (elapsed / totalDuration) * 100;
+                    setTimeRemaining(remaining);
+                    setWaitProgress(progressVal);
+                    setProgress('Crafting remaining 4-image conversion focused design plan...');
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            };
+            const timerPromise = updateTimer();
+
+            const resumePrompt = `Based on this previous analysis:
+${JSON.stringify(designPlan.analysis, null, 2)}
+
+And these first 3 images already generated:
+${JSON.stringify(designPlan.images.slice(0, 3), null, 2)}
+
+Please generate the remaining 4 images (Images 4, 5, 6, and 7) for the Amazon listing.
+Strategy:
+- Image 4: Size / dimensions or comparison chart
+- Image 5: Additional benefits or use cases
+- Image 6: Quality / certification / trust elements
+- Image 7: Final conversion image. Focus on value and trust. IMPORTANT: DO NOT USE "ADD TO CART". DO NOT GENERATE ANY CALL-TO-ACTION (CTA) text.
+
+Respond with ONLY a JSON object:
+{
+    "images": [
+        {
+            "imageNumber": 4, 
+            ... (same structure as before, ensuring unique productDisplayPrompt for each image without any text content)
+        },
+        ...
+    ]
+} `;
+
+            const response = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    max_tokens: 4000,
+                    messages: [{ role: 'user', content: resumePrompt }]
+                })
+            });
+
+            const data = await response.json();
+            if (data.error) throw new Error(data.error.message);
+
+            const text = data.content
+                .filter((item: any) => item.type === 'text')
+                .map((item: any) => item.text)
+                .join('\n');
+
+            const result = extractJson(text);
+
+            await timerPromise;
+
+            const updatedImages = [...designPlan.images, ...result.images];
+            const updatedPlan = { ...designPlan, images: updatedImages };
+
+            setDesignPlan(updatedPlan);
+            setIsPartialResult(false);
+            setProgress('Generation resumed successfully! ✓');
+
+            // Save the updated full project
+            await fetch('/api/projects/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    projectId: lastProjectId,
+                    generated_output: updatedPlan
+                })
+            });
+
+        } catch (err: any) {
+            setError(err.message || 'Failed to resume generation');
+        } finally {
+            setGenerating(false);
+        }
+    };
+
+    const downloadPDF = () => {
+        if (!designPlan) return;
+        console.log("Generating PDF with analysis:", designPlan.analysis);
+
+        // Open a new window for printing
+        const printWindow = window.open('', '_blank');
+        if (!printWindow) {
+            alert('Please allow popups to download the PDF.');
+            return;
+        }
+
+        const reportContent = `
+    <!DOCTYPE html>
+        <html>
+            <head>
+                <title>Amazon Listing Design Plan - ${projectInputs.productASIN || 'New Project'}</title>
+                <style>
+                    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; color: #1a202c; max-width: 800px; margin: 0 auto; padding: 40px; }
+                    h1 { color: #5b21b6; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+                    h2 { color: #4c1d95; margin-top: 30px; border-bottom: 1px solid #eee; padding-bottom: 5px; }
+                    h3 { color: #6d28d9; margin-top: 20px; }
+                    .section { margin-bottom: 30px; }
+                    .image-block { border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-bottom: 20px; page-break-inside: avoid; }
+                    .image-header { background: #f3f4f6; padding: 10px; margin: -20px -20px 20px -20px; border-bottom: 1px solid #e5e7eb; font-weight: bold; }
+                    .tag { display: inline-block; background: #e0e7ff; color: #3730a3; padding: 2px 8px; rounded: 4px; font-size: 0.8em; margin-right: 5px; }
+                    .prompt-box { background: #f0fdf4; border: 1px solid #bbf7d0; padding: 10px; border-radius: 6px; font-style: italic; color: #166534; white-space: pre-wrap; font-size: 0.9em; }
+                    @media print {
+                        body { padding: 0; }
+                    .no-print { display: none; }
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>LISTING CONTENTS AI - DESIGN PLAN</h1>
+                <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
+                <p><strong>ASIN:</strong> ${projectInputs.productASIN || 'N/A'}</p>
+
+                <div class="section">
+                    <h2>📦 Product Analysis & Strategy</h2>
+                    <p><strong>Product Analysis:</strong> ${designPlan.analysis?.productAnalysis || 'N/A'}</p>
+                    
+                    <h3>Target Audience</h3>
+                    <p>${designPlan.analysis?.targetAudience || 'N/A'}</p>
+                    
+                    <h3>Competitor Insights</h3>
+                    <p>${designPlan.analysis?.competitorInsights || 'N/A'}</p>
+
+                    <h3>Key Selling Points</h3>
+                    <ul>
+                        ${(designPlan.analysis?.keySellingPoints || []).map((p: any) => `<li>${p}</li>`).join('')}
+                    </ul>
+                    
+                    <h3>Design Strategy</h3>
+                    <p>${designPlan.analysis?.designStrategy || 'N/A'}</p>
+                </div>
+
+                <h2>📸 Image Design Plan (7 Images)</h2>
+                ${(designPlan.images || []).map((img: any) => `
+                    <div class="image-block">
+                        <div class="image-header">IMAGE ${img.imageNumber}: ${img.purpose?.toUpperCase() || 'N/A'}</div>
+                        
+                        <h3>📝 Text Content</h3>
+                        ${img.textContent?.headline ? `<p><strong>Headline:</strong> ${img.textContent.headline}</p>` : ''}
+                        ${img.textContent?.subheadline ? `<p><strong>Subheadline:</strong> ${img.textContent.subheadline}</p>` : ''}
+                        ${img.textContent?.badges && img.textContent.badges.length ? `<p><strong>Badges:</strong> ${img.textContent.badges.map((b: any) => `<span class="tag">${b}</span>`).join('')}</p>` : ''}
+                        ${img.textContent?.bulletPoints && img.textContent.bulletPoints.length ? `<ul>${img.textContent.bulletPoints.map((b: any) => `<li>${b}</li>`).join('')}</ul>` : ''}
+
+                        <h3>🎨 Visual Guidance</h3>
+                        <p><strong>Subject:</strong> ${img.visualGuidance?.layout || 'N/A'}</p>
+                        <p><strong>Style:</strong> ${img.visualGuidance?.style || 'N/A'}</p>
+                        <p><strong>Color Scheme:</strong> ${img.visualGuidance?.colorScheme || 'N/A'}</p>
+                        <p><strong>Typography:</strong> ${img.visualGuidance?.typography || 'N/A'}</p>
+                        <p><strong>Key Elements:</strong> ${(img.visualGuidance?.keyElements || []).join(', ')}</p>
+
+                        <div class="prompt-box">
+                            <strong>🤖 AI Prompt (2000x2000):</strong><br/>
+                            ${img.aiPrompt || 'N/A'}
+                        </div>
+                        
+                        <div class="prompt-box" style="margin-top: 10px; background: #fff7ed; border-color: #fdba74; color: #9a3412;">
+                            <strong>📦 Product Only Prompt (No Text):</strong><br/>
+                            ${img.productDisplayPrompt || 'Not generated'}
+                        </div>
+                    </div>
+                `).join('')}
+
+                <script>
+                    window.onload = function() { window.print(); }
+                </script>
+            </body>
+        </html>
+`;
+
+        printWindow.document.write(reportContent);
+        printWindow.document.close();
+    };
+
+    const copyToClipboard = (text: string, label: string) => {
+        navigator.clipboard.writeText(text);
+        alert(`${label} copied to clipboard!`);
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-50 via-purple-50 to-pink-50 p-4 md:p-8" id="app-root">
+            <div className="max-w-7xl mx-auto">
+                {/* Header */}
+                <div className="bg-white rounded-xl shadow-xl p-6 md:p-8 mb-6 flex flex-col md:flex-row justify-between items-center text-center md:text-left">
+                    <div>
+                        <div className="flex items-center justify-center md:justify-start gap-3 mb-3">
+                            <Zap className="w-10 h-10 text-purple-600" />
+                            <h1 className="text-3xl md:text-4xl font-bold text-gray-800">
+                                ListingContentAI
+                            </h1>
+                        </div>
+                        <p className="text-gray-600">
+                            AI-powered assistant to generate text content, visual guidance, and AI prompts for all 7 listing images
+                        </p>
+                    </div>
+                </div>
+
+                {/* Usage Status & Progress Bar */}
+                {hasAccess && (
+                    <div className="bg-gradient-to-r from-gray-900 to-gray-800 text-white rounded-xl shadow-lg p-5 mb-6 border border-gray-700">
+                        <div className="flex justify-between items-end mb-3">
+                            <div>
+                                <h3 className="font-bold text-lg flex items-center gap-2 mb-1">
+                                    <Zap className="w-5 h-5 text-yellow-400 fill-current" />
+                                    {currentPlan}
+                                </h3>
+                                <p className="text-sm text-gray-400">Monthly Usage</p>
+                            </div>
+                            <div className="text-right">
+                                <span className="text-2xl font-bold">{usageCount}</span>
+                                <span className="text-gray-400 text-sm"> / {usageLimit} Projects</span>
+                            </div>
+                        </div>
+
+                        {/* Progress Bar */}
+                        <div className="w-full bg-gray-700 rounded-full h-3 mb-2 overflow-hidden">
+                            <div
+                                className={`h-full rounded-full transition-all duration-1000 ease-out ${(usageCount / usageLimit) > 0.9 ? 'bg-red-500' :
+                                    (usageCount / usageLimit) > 0.7 ? 'bg-yellow-500' : 'bg-blue-500'
+                                    } `}
+                                style={{ width: `${Math.min((usageCount / usageLimit) * 100, 100)}%` }}
+                            ></div>
+                        </div>
+
+                        <div className="flex justify-between text-xs text-gray-400">
+                            <span>{Math.max(usageLimit - usageCount, 0)} projects remaining</span>
+                            <span className="text-purple-400 font-medium cursor-pointer hover:underline" onClick={onShowPricing}>Top up / Upgrade</span>
+                        </div>
+                    </div>
+                )}
+
+                {/* Access Blocking UI */}
+                {hasAccess === false && (
+                    <div className="bg-white rounded-xl shadow-xl p-8 mb-6 text-center border-l-4 border-yellow-500">
+                        <div className="max-w-md mx-auto">
+                            <h2 className="text-2xl font-bold text-gray-800 mb-4">
+                                {usageCount >= usageLimit ? 'Monthly Limit Reached 🔒' : 'Access Required 🔒'}
+                            </h2>
+                            <p className="text-gray-600 mb-6">
+                                {usageCount >= usageLimit
+                                    ? `You have reached your limit of ${usageLimit} projects on the ${currentPlan}. You can top up or upgrade your plan to continue immediately.`
+                                    : "This tool is available for premium members only. Please request access to start generating listing plans."}
+                            </p>
+
+                            {accessRequestStatus === 'success' || accessRequestStatus === 'existing' ? (
+                                <div className="bg-green-50 text-green-700 p-4 rounded-lg">
+                                    <p className="font-bold">Request Pending Approval</p>
+                                    <p className="text-sm mt-1">Status: Pending</p>
+                                    <p className="text-sm mt-2">Please contact support or wait for approval.</p>
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={onShowPricing}
+                                    className="px-8 py-3 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-lg font-bold hover:opacity-90 transition shadow-lg transform hover:scale-105"
+                                >
+                                    View Upgrade Options 🚀
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* Input Section - Only show if hasAccess is true */}
+                {hasAccess && (
+                    <div className="bg-white rounded-xl shadow-xl p-6 md:p-8 mb-6">
+                        <h2 className="text-2xl font-bold text-gray-800 mb-6 flex items-center gap-2">
+                            <FileText className="w-6 h-6 text-blue-600" />
+                            Project Inputs
+                        </h2>
+
+                        <div className="space-y-6">
+                            {/* Client Messages */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Client Messages & Requirements <span className="text-red-500">*</span>
+                                </label>
+                                <textarea
+                                    className="w-full h-32 p-3 border-2 border-gray-300 rounded-lg focus:border-purple-500 focus:outline-none text-sm text-gray-900"
+                                    placeholder="Paste all client messages, requirements, and project details here..."
+                                    value={projectInputs.clientMessages}
+                                    onChange={(e) => setProjectInputs({ ...projectInputs, clientMessages: e.target.value })}
+                                />
+                            </div>
+
+                            {/* Product ASIN/URL */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Product ASIN or Amazon URL
+                                </label>
+                                <input
+                                    type="text"
+                                    className="w-full p-3 border-2 border-gray-300 rounded-lg focus:border-purple-500 focus:outline-none text-sm text-gray-900"
+                                    placeholder="B08XYZ1234 or https://amazon.com/dp/B08XYZ1234"
+                                    value={projectInputs.productASIN}
+                                    onChange={(e) => setProjectInputs({ ...projectInputs, productASIN: e.target.value })}
+                                />
+                            </div>
+
+                            {/* Competitor Links */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Target Competitor Links (ASINs or URLs) <span className="text-red-500">*</span>
+                                </label>
+                                <textarea
+                                    className="w-full h-24 p-3 border-2 border-gray-300 rounded-lg focus:border-purple-500 focus:outline-none text-sm text-gray-900"
+                                    placeholder="Paste competitor Amazon URLs or ASINs (one per line)..."
+                                    value={projectInputs.competitorLinks}
+                                    onChange={(e) => setProjectInputs({ ...projectInputs, competitorLinks: e.target.value })}
+                                />
+                            </div>
+
+                            {/* Additional Info */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Additional Information
+                                </label>
+                                <textarea
+                                    className="w-full h-24 p-3 border-2 border-gray-300 rounded-lg focus:border-purple-500 focus:outline-none text-sm text-gray-900"
+                                    placeholder="Any other relevant information, brand guidelines, style preferences, etc..."
+                                    value={projectInputs.additionalInfo}
+                                    onChange={(e) => setProjectInputs({ ...projectInputs, additionalInfo: e.target.value })}
+                                />
+                            </div>
+
+                            {/* Brand Logo Upload (Optional) */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Brand Logo (Optional)
+                                </label>
+                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-purple-500 transition-colors">
+                                    {brandLogo ? (
+                                        <div className="relative group inline-block">
+                                            <img
+                                                src={brandLogo.preview}
+                                                alt={brandLogo.name}
+                                                className="h-32 object-contain rounded-lg border-2 border-gray-200"
+                                            />
+                                            <button
+                                                onClick={() => removeImage(0, 'logo')}
+                                                className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </button>
+                                            <p className="text-xs text-gray-500 mt-2">{brandLogo.name}</p>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <ImageIcon className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+                                            <input
+                                                ref={brandLogoRef}
+                                                type="file"
+                                                accept="image/*"
+                                                onChange={(e) => handleImageUpload(e.target.files, 'logo')}
+                                                className="hidden"
+                                            />
+                                            <button
+                                                onClick={() => brandLogoRef.current?.click()}
+                                                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm"
+                                            >
+                                                Upload Brand Logo
+                                            </button>
+                                            <p className="text-xs text-gray-500 mt-2">Upload brand logo (if any)</p>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Product Images Upload */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Product Images (At least 4 required) <span className="text-red-500">*</span>
+                                </label>
+                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-purple-500 transition-colors">
+                                    <Upload className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+                                    <input
+                                        ref={productFileRef}
+                                        type="file"
+                                        accept="image/*"
+                                        multiple
+                                        onChange={(e) => handleImageUpload(e.target.files, 'product')}
+                                        className="hidden"
+                                    />
+                                    <button
+                                        onClick={() => productFileRef.current?.click()}
+                                        className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm"
+                                    >
+                                        Upload Product Images
+                                    </button>
+                                    <p className="text-xs text-gray-500 mt-2">Upload images sent by client</p>
+                                </div>
+
+                                {productImages.length > 0 && (
+                                    <div className="mt-4 grid grid-cols-3 md:grid-cols-5 gap-3">
+                                        {productImages.map((img, index) => (
+                                            <div key={index} className="relative group">
+                                                <img
+                                                    src={img.preview}
+                                                    alt={img.name}
+                                                    className="w-full h-24 object-cover rounded-lg border-2 border-gray-200"
+                                                />
+                                                <button
+                                                    onClick={() => removeImage(index, 'product')}
+                                                    className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                                                >
+                                                    <Trash2 className="w-3 h-3" />
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Competitor/Ad Images Upload */}
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Competitor/Reference Images <span className="text-red-500">*</span>
+                                </label>
+                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-purple-500 transition-colors">
+                                    <Upload className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+                                    <input
+                                        ref={competitorFileRef}
+                                        type="file"
+                                        accept="image/*"
+                                        multiple
+                                        onChange={(e) => handleImageUpload(e.target.files, 'competitor')}
+                                        className="hidden"
+                                    />
+                                    <button
+                                        onClick={() => competitorFileRef.current?.click()}
+                                        className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm"
+                                    >
+                                        Upload Reference Images
+                                    </button>
+                                    <p className="text-xs text-gray-500 mt-2">Upload competitor listings or ad images</p>
+                                </div>
+
+                                {competitorImages.length > 0 && (
+                                    <div className="mt-4 grid grid-cols-3 md:grid-cols-5 gap-3">
+                                        {competitorImages.map((img, index) => (
+                                            <div key={index} className="relative group">
+                                                <img
+                                                    src={img.preview}
+                                                    alt={img.name}
+                                                    className="w-full h-24 object-cover rounded-lg border-2 border-gray-200"
+                                                />
+                                                <button
+                                                    onClick={() => removeImage(index, 'competitor')}
+                                                    className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                                                >
+                                                    <Trash2 className="w-3 h-3" />
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Generate Button */}
+                        <button
+                            onClick={generateDesignPlan}
+                            disabled={generating}
+                            className="mt-6 w-full px-6 py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-lg font-bold hover:from-purple-700 hover:to-pink-700 disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed flex items-center justify-center gap-3 transition-all text-lg shadow-lg"
+                        >
+                            {generating ? (
+                                <span className="flex items-center gap-2">
+                                    Generates in ~3 mins
+                                </span>
+                            ) : (
+                                <>
+                                    <Zap className="w-6 h-6" />
+                                    Generate Complete Design Plan
+                                </>
+                            )}
+                        </button>
+
+                        {generating && (
+                            <div className="mt-8 flex flex-col items-center justify-center p-8 bg-white rounded-xl shadow-inner border border-gray-100">
+                                {/* Circular Clock Animation */}
+                                <div className="relative w-32 h-32 mb-4">
+                                    <svg className="w-full h-full transform -rotate-90">
+                                        <circle
+                                            cx="64"
+                                            cy="64"
+                                            r="58"
+                                            fill="none"
+                                            stroke="#e5e7eb"
+                                            strokeWidth="8"
+                                        />
+                                        <circle
+                                            cx="64"
+                                            cy="64"
+                                            r="58"
+                                            fill="none"
+                                            stroke="#8b5cf6"
+                                            strokeWidth="8"
+                                            strokeDasharray="364"
+                                            strokeDashoffset={364 - (364 * waitProgress) / 100}
+                                            strokeLinecap="round"
+                                            className="transition-all duration-1000 ease-linear"
+                                        />
+                                    </svg>
+                                    <div className="absolute top-0 left-0 w-full h-full flex flex-col items-center justify-center text-purple-600">
+                                        <span className="text-3xl font-bold">{Math.floor(timeRemaining / 60)}:{(timeRemaining % 60).toString().padStart(2, '0')}</span>
+                                    </div>
+                                </div>
+
+                                <h3 className="text-xl font-bold text-gray-800 mb-2 animate-pulse">{progress}</h3>
+                                <p className="text-gray-500 text-center max-w-md">
+                                    Our AI agents are analyzing your product, researching competitors, and crafting the perfect strategy. Good things take time!
+                                </p>
+                            </div>
+                        )}
+
+                        {error && (
+                            <div className="mt-4 p-4 bg-red-50 border-l-4 border-red-500 text-red-700 rounded">
+                                {error}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {/* Results Section */}
+                {designPlan && (
+                    <>
+                        {/* Project Analysis Summary */}
+                        <div className="bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl shadow-xl p-6 md:p-8 mb-6 text-white">
+                            <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+                                <Lightbulb className="w-6 h-6" />
+                                Project Analysis
+                            </h2>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <p className="font-semibold mb-1 text-base md:text-lg">Product:</p>
+                                    <p className="text-sm md:text-base opacity-95">{designPlan.analysis.productAnalysis}</p>
+                                </div>
+                                <div>
+                                    <p className="font-semibold mb-1 text-base md:text-lg">Target Audience:</p>
+                                    <p className="text-sm md:text-base opacity-95">{designPlan.analysis.targetAudience}</p>
+                                </div>
+                                <div className="md:col-span-2">
+                                    <p className="font-semibold mb-1 text-base md:text-lg">Strategy:</p>
+                                    <p className="text-sm md:text-base opacity-95">{designPlan.analysis.designStrategy}</p>
+                                </div>
+                            </div>
+
+                            <div className="flex flex-col sm:flex-row gap-4 mt-8">
+                                <button
+                                    onClick={downloadPDF}
+                                    className="w-full sm:w-auto px-6 py-4 bg-white text-purple-600 rounded-lg font-bold hover:bg-gray-100 transition shadow-md flex items-center justify-center gap-2"
+                                >
+                                    <Printer className="w-5 h-5" />
+                                    Download Design Plan (PDF)
+                                </button>
+
+                                {isPartialResult && currentPlan !== 'Free Demo' && (
+                                    <button
+                                        onClick={resumeGeneration}
+                                        disabled={generating}
+                                        className="w-full sm:w-auto px-6 py-4 bg-yellow-400 text-gray-900 rounded-lg font-bold hover:bg-yellow-500 transition shadow-md flex items-center justify-center gap-2 animate-pulse"
+                                    >
+                                        <Zap className="w-5 h-5 fill-current" />
+                                        Resume & Generate Remaining 4 Images
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Design Plans for Each Image */}
+                        <div className="space-y-6">
+                            {designPlan.images.map((image: any, index: number) => (
+                                <div key={index} className="bg-white rounded-xl shadow-xl p-6 md:p-8">
+                                    <div className="flex items-center justify-between mb-6">
+                                        <h3 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
+                                            <ImageIcon className="w-6 h-6 text-purple-600" />
+                                            Image {image.imageNumber}: {image.purpose}
+                                        </h3>
+                                    </div>
+
+                                    <div className="grid md:grid-cols-2 gap-6">
+                                        {/* Text Content */}
+                                        <div className="space-y-4">
+                                            <div className="bg-blue-50 rounded-lg p-4">
+                                                <h4 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
+                                                    <FileText className="w-5 h-5 text-blue-600" />
+                                                    Text Content
+                                                </h4>
+                                                <div className="space-y-3 text-sm">
+                                                    {image.textContent.headline && (
+                                                        <div>
+                                                            <p className="font-semibold text-gray-700">Headline:</p>
+                                                            <p className="text-gray-600 bg-white p-2 rounded mt-1">{image.textContent.headline}</p>
+                                                        </div>
+                                                    )}
+                                                    {image.textContent.subheadline && (
+                                                        <div>
+                                                            <p className="font-semibold text-gray-700">Subheadline:</p>
+                                                            <p className="text-gray-600 bg-white p-2 rounded mt-1">{image.textContent.subheadline}</p>
+                                                        </div>
+                                                    )}
+                                                    {image.textContent.bulletPoints?.length > 0 && (
+                                                        <div>
+                                                            <p className="font-semibold text-gray-700">Bullet Points:</p>
+                                                            <ul className="bg-white p-2 rounded mt-1 space-y-1">
+                                                                {image.textContent.bulletPoints.map((bullet: string, i: number) => (
+                                                                    <li key={i} className="text-gray-600">• {bullet}</li>
+                                                                ))}
+                                                            </ul>
+                                                        </div>
+                                                    )}
+                                                    {image.textContent.badges?.length > 0 && (
+                                                        <div>
+                                                            <p className="font-semibold text-gray-700">Badges:</p>
+                                                            <div className="flex flex-wrap gap-2 mt-1">
+                                                                {image.textContent.badges.map((badge: string, i: number) => (
+                                                                    <span key={i} className="bg-white px-2 py-1 rounded text-xs text-gray-600">
+                                                                        {badge}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* Visual Guidance */}
+                                            <div className="bg-purple-50 rounded-lg p-4">
+                                                <h4 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
+                                                    <Lightbulb className="w-5 h-5 text-purple-600" />
+                                                    Visual Guidance
+                                                </h4>
+                                                <div className="space-y-2 text-sm text-gray-700">
+                                                    <p><span className="font-semibold text-gray-900">Layout:</span> {image.visualGuidance.layout}</p>
+                                                    <p><span className="font-semibold text-gray-900">Colors:</span> {image.visualGuidance.colorScheme}</p>
+                                                    <p><span className="font-semibold text-gray-900">Typography:</span> {image.visualGuidance.typography}</p>
+                                                    <p><span className="font-semibold text-gray-900">Style:</span> {image.visualGuidance.style}</p>
+                                                    <div>
+                                                        <p className="font-semibold text-gray-900 mb-1">Key Elements:</p>
+                                                        <ul className="space-y-1">
+                                                            {image.visualGuidance.keyElements.map((element: string, i: number) => (
+                                                                <li key={i} className="text-gray-700">• {element}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* AI Prompt */}
+                                        <div>
+                                            <div className="bg-gradient-to-br from-pink-50 to-orange-50 rounded-lg p-4 h-full">
+                                                <div className="flex items-center justify-between mb-3">
+                                                    <h4 className="font-bold text-gray-800 flex items-center gap-2">
+                                                        <Zap className="w-5 h-5 text-pink-600" />
+                                                        AI Image Generation Prompt
+                                                    </h4>
+                                                    <button
+                                                        onClick={() => copyToClipboard(image.aiPrompt, 'AI Prompt')}
+                                                        className="px-3 py-1 bg-pink-600 text-white text-xs rounded hover:bg-pink-700 transition-colors"
+                                                    >
+                                                        Copy
+                                                    </button>
+                                                </div>
+                                                <div className="bg-white rounded p-3 text-sm text-gray-700 max-h-64 overflow-y-auto">
+                                                    {image.aiPrompt}
+                                                </div>
+                                                <p className="text-xs text-gray-500 mt-2">
+                                                    Use this prompt in Midjourney, DALL-E, or other AI image generators
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        {/* Product Only Prompt (Round 12) */}
+                                        {image.productDisplayPrompt && (
+                                            <div className="mt-4">
+                                                <div className="bg-gray-50 rounded-lg p-4 h-full border border-gray-200">
+                                                    <div className="flex items-center justify-between mb-2">
+                                                        <h4 className="font-bold text-gray-700 flex items-center gap-2 text-sm">
+                                                            <ImageIcon className="w-4 h-4 text-gray-500" />
+                                                            Product Only Prompt (No Text)
+                                                        </h4>
+                                                        <button
+                                                            onClick={() => copyToClipboard(image.productDisplayPrompt, 'Product Only Prompt')}
+                                                            className="px-2 py-1 bg-gray-200 text-gray-700 text-xs rounded hover:bg-gray-300 transition-colors"
+                                                        >
+                                                            Copy
+                                                        </button>
+                                                    </div>
+                                                    <div className="bg-white rounded p-3 text-sm text-gray-600 italic">
+                                                        {image.productDisplayPrompt}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Refinement Interface */}
+                                    <div className="mt-6 border-t pt-4 md:col-span-2">
+                                        <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-2">
+                                            <Zap className="w-4 h-4 text-orange-500" />
+                                            Revise with AI
+                                        </h4>
+                                        <div className="flex flex-col sm:flex-row gap-2">
+                                            <input
+                                                type="text"
+                                                placeholder="Tell the AI what to change..."
+                                                className="flex-1 p-3 border border-gray-300 rounded-lg text-sm focus:border-purple-500 outline-none text-gray-900 bg-white"
+                                                value={refiningImageId === image.imageNumber ? refinementInstruction : ''}
+                                                onChange={(e) => {
+                                                    setRefinementInstruction(e.target.value);
+                                                    if (refiningImageId !== image.imageNumber) setRefiningImageId(image.imageNumber);
+                                                }}
+                                            />
+                                            <button
+                                                onClick={() => handleRefine(image)}
+                                                disabled={refiningImageId === image.imageNumber && (!refinementInstruction.trim() || !image.imageNumber)}
+                                                className="w-full sm:w-auto px-6 py-3 bg-orange-500 text-white rounded-lg text-sm font-bold hover:bg-orange-600 transition disabled:opacity-50 flex items-center justify-center gap-2"
+                                            >
+                                                {refiningImageId === image.imageNumber && refinementInstruction ? 'Update' : 'Revise'}
+                                                {refiningImageId === image.imageNumber && (
+                                                    <span className="hidden group-active:inline-block animate-pulse">...</span>
+                                                )}
+                                            </button>
+                                        </div>
+                                        {refiningImageId === image.imageNumber && refinementInstruction && (
+                                            <p className="text-xs text-gray-500 mt-1">
+                                                Pressing update will regenerate this specific image plan.
+                                            </p>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </>
+                )}
+
+                {/* Upgrade Modal */}
+                {isUpgradeModalOpen && (
+                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-4">
+                        <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8 text-center">
+                            <div className="w-20 h-20 bg-purple-100 text-purple-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                                <Zap className="w-10 h-10" />
+                            </div>
+                            <h3 className="text-2xl font-bold text-gray-900 mb-2">Upgrade to See All 7 Images</h3>
+                            <p className="text-gray-600 mb-8">
+                                You just generated a plan for 3 images. To generate the remaining 4 high-conversion images, please purchase a plan.
+                            </p>
+                            <div className="space-y-3">
+                                <button
+                                    onClick={() => {
+                                        setIsUpgradeModalOpen(false);
+                                        onShowPricing?.();
+                                    }}
+                                    className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-xl font-bold hover:opacity-90 transition shadow-lg"
+                                >
+                                    View Pricing & Upgrade 🚀
+                                </button>
+                                <button
+                                    onClick={() => setIsUpgradeModalOpen(false)}
+                                    className="w-full py-3 text-gray-500 font-medium hover:text-gray-700 transition"
+                                >
+                                    Later
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
